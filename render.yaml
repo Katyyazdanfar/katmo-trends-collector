@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: katmo-trends-collector
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: KATMO_API_KEY
+        generateValue: true

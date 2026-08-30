@@ -1,0 +1,69 @@
+openapi: 3.1.0
+info:
+  title: KatMo Google Trends Collector
+  version: 1.0.0
+  description: Retrieves real custom-query Google Trends data for KatMo.
+servers:
+  - url: https://REPLACE_WITH_RENDER_URL
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      summary: Check collector status
+      responses:
+        "200":
+          description: Service status
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /validate-candidate:
+    post:
+      operationId: validateCandidateTrends
+      summary: Validate one KatMo candidate with Google Trends
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CandidateRequest"
+      responses:
+        "200":
+          description: Google Trends validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    CandidateRequest:
+      type: object
+      required:
+        - candidate_id
+        - topic
+        - queries
+      properties:
+        candidate_id:
+          type: string
+        topic:
+          type: string
+        queries:
+          type: array
+          minItems: 3
+          maxItems: 5
+          items:
+            type: string
+        geo:
+          type: string
+          default: US
+        include_five_year:
+          type: boolean
+          default: true
