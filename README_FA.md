@@ -1,37 +1,50 @@
-# KatMo Trends Collector v2 — 429 Fix
+# KatMo Trends Collector v3 — Failed-to-fetch Fix
 
-این نسخه برای کاهش خطای Google Trends 429 ساخته شده و جایگزین کامل نسخه قبلی است.
+این نسخه جایگزین کامل v2 است.
 
-تغییرات اصلی:
-- فاصله اجباری بین درخواست‌ها
-- jitter تصادفی
-- exponential backoff برای 429
-- refresh کردن session/cookies بین retryها
-- cache شش‌ساعته
-- جلوگیری از اجرای 5-year بلافاصله بعد از 429 روی 12-month
-- warm browser session
+خطای مشاهده‌شده:
+`Page.evaluate: TypeError: Failed to fetch`
 
-## جایگزینی روی GitHub
+علت:
+نسخه v2 درخواست Google Trends را از داخل `page.evaluate(fetch(...))` اجرا می‌کرد.
+در محیط Render این fetch مرورگری شکست می‌خورد و endpoint با 500 تمام می‌شد.
 
-کل فایل‌های repo قبلی را با محتوای این ZIP جایگزین کن، با همین ساختار:
+اصلاح v3:
+- حذف کامل `page.evaluate(fetch(...))`
+- استفاده از `BrowserContext.request.get(...)`
+- حفظ session/cookies مرورگر Playwright
+- حفظ pace / backoff / jitter / cache
+- اضافه‌شدن route اصلی `/` تا GET / دیگر 404 ندهد
+- خطاهای شبکه حالا به‌صورت structured response برمی‌گردند، نه crash/500
 
-app/main.py
-requirements.txt
-Dockerfile
-render.yaml
-.dockerignore
+## کاری که باید انجام شود
 
-فایل‌های Action داخل GPT نیاز به تغییر ندارند، چون endpointها همان‌اند:
-GET /health
-POST /validate-candidate
+کل محتویات repo قبلی را با فایل‌های این ZIP جایگزین کن:
 
-## بعد از Deploy
+- app/main.py
+- requirements.txt
+- Dockerfile
+- render.yaml
+- .dockerignore
 
-1. صبر کن Render Live شود.
-2. health را باز کن:
-   https://katmo-trends-collector-1.onrender.com/health
-3. باید version = 2.0.0 ببینی.
-4. سپس فقط یک Candidate را در GPT تست کن.
-5. اگر FULL یا PARTIAL با داده واقعی برگشت، بعد سراغ تست 5–6 candidate برو.
+بعد Commit کن.
 
-اگر همچنان 429 کامل باقی ماند، مشکل به احتمال زیاد reputation/IP دیتاسنتر Render در برابر Google Trends است و دیگر با prompt یا retry بیشتر حل نمی‌شود.
+Render باید خودکار Deploy کند.
+
+## تست بعد از Live شدن
+
+این آدرس را باز کن:
+
+https://katmo-trends-collector-1.onrender.com/health
+
+باید ببینی:
+
+"version": "3.0.0"
+
+و:
+
+"fetch_strategy": "playwright-context-request"
+
+بعد فقط یک بار `validateCandidateTrends` را در GPT Builder تست کن.
+
+اگر نتیجه 429 بود، دیگر مشکل crash نیست و محدودیت IP خود Render/Google Trends مطرح است.
