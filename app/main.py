@@ -3,27 +3,26 @@ import json
 import time
 import random
 import hashlib
+import urllib.parse
 from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from playwright.async_api import async_playwright, Browser, BrowserContext
 
-app = FastAPI(title="KatMo Trends Collector", version="2.0.0")
+app = FastAPI(title="KatMo Trends Collector", version="3.0.0")
 
 API_KEY = os.getenv("KATMO_API_KEY", "").strip()
 
-# Conservative defaults for Render Free + Google Trends.
 REQUEST_GAP_SECONDS = float(os.getenv("TRENDS_REQUEST_GAP_SECONDS", "3.5"))
 RETRY_BASE_SECONDS = float(os.getenv("TRENDS_RETRY_BASE_SECONDS", "8"))
 MAX_RETRIES = int(os.getenv("TRENDS_MAX_RETRIES", "3"))
-CACHE_TTL_SECONDS = int(os.getenv("TRENDS_CACHE_TTL_SECONDS", "21600"))  # 6h
+CACHE_TTL_SECONDS = int(os.getenv("TRENDS_CACHE_TTL_SECONDS", "21600"))
 
 _cache: Dict[str, Dict[str, Any]] = {}
 _pw = None
 _browser: Optional[Browser] = None
 _context: Optional[BrowserContext] = None
-_page: Optional[Page] = None
 _last_request_at = 0.0
 
 UA = (
@@ -44,12 +43,11 @@ class CandidateRequest(BaseModel):
 def check_auth(authorization: Optional[str]):
     if not API_KEY:
         return
-    expected = f"Bearer {API_KEY}"
-    if authorization != expected:
+    if authorization != f"Bearer {API_KEY}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _cache_key(payload: CandidateRequest) -> str:
+def cache_key(payload: CandidateRequest) -> str:
     raw = json.dumps(
         {
             "topic": payload.topic,
@@ -64,63 +62,81 @@ def _cache_key(payload: CandidateRequest) -> str:
 
 
 async def ensure_browser():
-    global _pw, _browser, _context, _page
-    if _browser is not None and _context is not None and _page is not None:
+    global _pw, _browser, _context
+    if _browser is not None and _context is not None:
         return
+
     _pw = await async_playwright().start()
     _browser = await _pw.chromium.launch(headless=True)
     _context = await _browser.new_context(
         user_agent=UA,
         locale="en-US",
         timezone_id="America/New_York",
-        viewport={"width": 1365, "height": 900},
         extra_http_headers={
             "Accept-Language": "en-US,en;q=0.9",
-            "DNT": "1",
         },
     )
-    _page = await _context.new_page()
-    # Warm Google domain and establish cookies before API calls.
+
+    # Warm session once to establish Google Trends cookies.
+    page = await _context.new_page()
     try:
-        await _page.goto(
+        await page.goto(
             "https://trends.google.com/trends/explore?geo=US",
             wait_until="domcontentloaded",
             timeout=45000,
         )
-        await _page.wait_for_timeout(2500)
+        await page.wait_for_timeout(2500)
     except Exception:
         pass
+    finally:
+        await page.close()
 
 
 async def paced_wait():
     global _last_request_at
+    await ensure_browser()
     now = time.monotonic()
     elapsed = now - _last_request_at
+
     if elapsed < REQUEST_GAP_SECONDS:
-        await _page.wait_for_timeout(int((REQUEST_GAP_SECONDS - elapsed) * 1000))
-    # Jitter reduces deterministic bursts.
-    await _page.wait_for_timeout(random.randint(600, 1400))
+        await _context.request.get(
+            "https://trends.google.com/robots.txt",
+            timeout=15000
+        ) if False else None
+        await asyncio_sleep(REQUEST_GAP_SECONDS - elapsed)
+
+    await asyncio_sleep(random.uniform(0.6, 1.4))
     _last_request_at = time.monotonic()
 
 
-async def browser_fetch_json(url: str):
+async def asyncio_sleep(seconds: float):
+    import asyncio
+    await asyncio.sleep(seconds)
+
+
+async def request_text(url: str):
+    """
+    IMPORTANT:
+    Uses BrowserContext.request instead of page.evaluate(fetch(...)).
+    This avoids browser-side CORS/fetch failures on Render while retaining
+    the browser context's cookies and headers.
+    """
     await ensure_browser()
     await paced_wait()
-    result = await _page.evaluate(
-        """async (url) => {
-            const r = await fetch(url, {
-              credentials: 'include',
-              headers: {
-                'accept': 'application/json, text/plain, */*',
-                'x-client-data': ''
-              }
-            });
-            const text = await r.text();
-            return {status: r.status, text};
-        }""",
-        url,
-    )
-    return result["status"], result["text"]
+
+    try:
+        response = await _context.request.get(
+            url,
+            headers={
+                "Accept": "application/json,text/plain,*/*",
+                "Referer": "https://trends.google.com/trends/explore?geo=US",
+            },
+            timeout=45000,
+            fail_on_status_code=False,
+        )
+        return response.status, await response.text()
+    except Exception as e:
+        return 599, f"{type(e).__name__}: {e}"
 
 
 def strip_xssi(text: str) -> str:
@@ -132,40 +148,26 @@ def strip_xssi(text: str) -> str:
 async def fetch_with_backoff(url: str):
     last_status = None
     last_text = ""
+
     for attempt in range(MAX_RETRIES + 1):
-        status, text = await browser_fetch_json(url)
+        status, text = await request_text(url)
         last_status, last_text = status, text
 
         if status == 200:
             return status, text, attempt
 
-        if status == 429:
-            if attempt < MAX_RETRIES:
-                # Exponential backoff + jitter: 8s, 16s, 32s by default.
-                sleep_s = RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(1.0, 4.0)
-                await _page.wait_for_timeout(int(sleep_s * 1000))
-                # Refresh normal Trends page to renew cookies/session.
-                try:
-                    await _page.goto(
-                        "https://trends.google.com/trends/explore?geo=US",
-                        wait_until="domcontentloaded",
-                        timeout=45000,
-                    )
-                    await _page.wait_for_timeout(random.randint(1800, 3200))
-                except Exception:
-                    pass
-                continue
+        if status == 429 and attempt < MAX_RETRIES:
+            delay = RETRY_BASE_SECONDS * (2 ** attempt) + random.uniform(1.0, 4.0)
+            await asyncio_sleep(delay)
+            continue
+
         break
 
     return last_status, last_text, MAX_RETRIES
 
 
 def build_explore_url(queries: List[str], geo: str, timeframe: str) -> str:
-    import urllib.parse
-    comparison = [
-        {"keyword": q, "geo": geo, "time": timeframe}
-        for q in queries
-    ]
+    comparison = [{"keyword": q, "geo": geo, "time": timeframe} for q in queries]
     req = {
         "comparisonItem": comparison,
         "category": 0,
@@ -180,33 +182,39 @@ def build_explore_url(queries: List[str], geo: str, timeframe: str) -> str:
 
 
 async def get_multiline(queries: List[str], geo: str, timeframe: str):
-    import urllib.parse
-
     explore_url = build_explore_url(queries, geo, timeframe)
     status, text, retries = await fetch_with_backoff(explore_url)
+
     if status != 200:
         return {
             "ok": False,
             "stage": "explore",
             "http_status": status,
             "retries": retries,
+            "error_excerpt": text[:180] if text else None,
         }
 
     try:
         explore = json.loads(strip_xssi(text))
-    except Exception:
+    except Exception as e:
         return {
             "ok": False,
             "stage": "explore_parse",
             "http_status": status,
             "retries": retries,
+            "error_excerpt": str(e)[:180],
         }
 
     widgets = explore.get("widgets", [])
     ts_widget = next(
-        (w for w in widgets if w.get("id") == "TIMESERIES" or w.get("title") == "Interest over time"),
+        (
+            w for w in widgets
+            if w.get("id") == "TIMESERIES"
+            or w.get("title") == "Interest over time"
+        ),
         None,
     )
+
     if not ts_widget:
         return {
             "ok": False,
@@ -217,6 +225,7 @@ async def get_multiline(queries: List[str], geo: str, timeframe: str):
 
     token = ts_widget.get("token")
     req = ts_widget.get("request")
+
     if not token or not req:
         return {
             "ok": False,
@@ -231,32 +240,37 @@ async def get_multiline(queries: List[str], geo: str, timeframe: str):
         "req": json.dumps(req, separators=(",", ":")),
         "token": token,
     }
+
     multiline_url = (
         "https://trends.google.com/trends/api/widgetdata/multiline?"
         + urllib.parse.urlencode(params)
     )
 
     status2, text2, retries2 = await fetch_with_backoff(multiline_url)
+
     if status2 != 200:
         return {
             "ok": False,
             "stage": "multiline",
             "http_status": status2,
             "retries": retries2,
+            "error_excerpt": text2[:180] if text2 else None,
         }
 
     try:
         payload = json.loads(strip_xssi(text2))
-    except Exception:
+    except Exception as e:
         return {
             "ok": False,
             "stage": "multiline_parse",
             "http_status": status2,
             "retries": retries2,
+            "error_excerpt": str(e)[:180],
         }
 
     timeline = payload.get("default", {}).get("timelineData", [])
     series = {q: [] for q in queries}
+
     for row in timeline:
         values = row.get("value", [])
         for i, q in enumerate(queries):
@@ -267,18 +281,21 @@ async def get_multiline(queries: List[str], geo: str, timeframe: str):
     for q, vals in series.items():
         if vals:
             n = len(vals)
-            recent_window = vals[max(0, n - max(4, n // 8)):]
-            early_window = vals[:max(4, n // 8)]
-            avg = sum(vals) / len(vals)
-            recent_avg = sum(recent_window) / len(recent_window)
-            early_avg = sum(early_window) / len(early_window)
+            window = max(4, n // 8)
+            recent = vals[-window:]
+            early = vals[:window]
+            avg = sum(vals) / n
+            recent_avg = sum(recent) / len(recent)
+            early_avg = sum(early) / len(early)
             delta = recent_avg - early_avg
+
             if delta > 5:
                 direction = "UP"
             elif delta < -5:
                 direction = "DOWN"
             else:
                 direction = "FLAT"
+
             summary[q] = {
                 "average": round(avg, 1),
                 "recent_average": round(recent_avg, 1),
@@ -301,12 +318,23 @@ async def get_multiline(queries: List[str], geo: str, timeframe: str):
     }
 
 
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "service": "KatMo Trends Collector",
+        "version": "3.0.0",
+        "health": "/health",
+    }
+
+
 @app.get("/health")
 async def health():
     return {
         "ok": True,
         "service": "KatMo Trends Collector",
-        "version": "2.0.0",
+        "version": "3.0.0",
+        "fetch_strategy": "playwright-context-request",
         "rate_limit_strategy": "paced+exponential_backoff+cache",
     }
 
@@ -318,20 +346,22 @@ async def validate_candidate(
 ):
     check_auth(authorization)
 
-    # Clean query set and reduce duplicate request load.
     queries = []
-    for q in payload.queries:
-        q = q.strip()
-        if q and q.lower() not in {x.lower() for x in queries}:
+    seen = set()
+    for raw in payload.queries:
+        q = raw.strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
             queries.append(q)
     queries = queries[:5]
 
     if not queries:
         raise HTTPException(status_code=400, detail="At least one query is required.")
 
-    key = _cache_key(payload)
+    key = cache_key(payload)
     cached = _cache.get(key)
     now = time.time()
+
     if cached and now - cached["stored_at"] < CACHE_TTL_SECONDS:
         result = dict(cached["result"])
         result["cache"] = "HIT"
@@ -339,25 +369,31 @@ async def validate_candidate(
 
     twelve = await get_multiline(queries, payload.geo, "today 12-m")
 
-    # Avoid hitting Google immediately again after a 429-heavy result.
-    if twelve.get("http_status") == 429:
+    if payload.include_five_year:
+        # Avoid hammering Google immediately if the first window is already rate-limited.
+        if twelve.get("http_status") == 429:
+            five = {
+                "ok": False,
+                "stage": "skipped_after_12m_rate_limit",
+                "http_status": 429,
+                "retries": 0,
+            }
+        else:
+            await asyncio_sleep(random.uniform(5.0, 8.0))
+            five = await get_multiline(queries, payload.geo, "today 5-y")
+    else:
         five = {
             "ok": False,
-            "stage": "skipped_after_12m_rate_limit",
-            "http_status": 429,
+            "stage": "not_requested",
+            "http_status": None,
             "retries": 0,
         }
-    elif payload.include_five_year:
-        # Extra breathing room between large windows.
-        await _page.wait_for_timeout(random.randint(5000, 8000))
-        five = await get_multiline(queries, payload.geo, "today 5-y")
-    else:
-        five = {"ok": False, "stage": "not_requested", "http_status": None, "retries": 0}
 
-    access = "FULL"
-    if not twelve.get("ok") or (payload.include_five_year and not five.get("ok")):
+    if twelve.get("ok") and (five.get("ok") or not payload.include_five_year):
+        access = "FULL"
+    elif twelve.get("ok") or five.get("ok"):
         access = "PARTIAL"
-    if not twelve.get("ok") and not five.get("ok"):
+    else:
         access = "UNAVAILABLE"
 
     result = {
@@ -370,8 +406,9 @@ async def validate_candidate(
         "trends_receipt": {
             "source": "Google Trends custom-query Explore backend",
             "access_status": access,
-            "collector_version": "2.0.0",
+            "collector_version": "3.0.0",
             "retrieved_at_epoch": int(time.time()),
+            "fetch_strategy": "playwright-context-request",
             "rate_limit_strategy": "paced+exponential_backoff+jitter+6h_cache",
         },
         "cache": "MISS",
