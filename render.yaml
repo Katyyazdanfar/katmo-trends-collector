@@ -4,7 +4,14 @@ services:
     runtime: docker
     plan: free
     healthCheckPath: /health
-    autoDeploy: true
     envVars:
       - key: KATMO_API_KEY
-        generateValue: true
+        sync: false
+      - key: TRENDS_REQUEST_GAP_SECONDS
+        value: "3.5"
+      - key: TRENDS_RETRY_BASE_SECONDS
+        value: "8"
+      - key: TRENDS_MAX_RETRIES
+        value: "3"
+      - key: TRENDS_CACHE_TTL_SECONDS
+        value: "21600"
